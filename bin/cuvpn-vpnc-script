@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+#
+# cuvpn-vpnc-script — wraps /etc/vpnc/vpnc-script for cuvpn limited mode.
+#
+# After CU's standard vpnc-script processing, in limited mode:
+#   1. Strip CU's over-broad route pushes (10.0.0.0/8, 192.168.0.0/16,
+#      172.16.0.0/12) that collide with home WG / LAN / docker. Only the
+#      CU Boulder allowlist (128.138/16, 198.11.16/20, 198.59.7/24,
+#      204.228.80/24, 172.21.39/24) stays on the cuvpn interface.
+#   2. Scope cuvpn's DNS to *.colorado.edu zones only and remove its
+#      default-route DNS claim, so systemd-resolved sends only matching
+#      queries here. Everything else stays on the host's primary resolver
+#      (e.g. Wafariya pihole via wg3) — see CUVPN_DNS_ZONES override.
+#
+# Override the route keep-list with CUVPN_KEEP_PREFIXES (space-separated
+# CIDRs) or one CIDR per line in /etc/cuvpn/keep-prefixes or
+# $HOME/.config/cuvpn/keep-prefixes. Override DNS zones with
+# CUVPN_DNS_ZONES (space-separated, '~'-prefixed routing domains).
+#
+# Full-tunnel mode is untouched (this whole block is gated to limited).
+
+set -u
+
+REAL_VPNC_SCRIPT=/etc/vpnc/vpnc-script
+
+if [[ ! -x "$REAL_VPNC_SCRIPT" ]]; then
+    echo "Missing upstream vpnc-script: $REAL_VPNC_SCRIPT" >&2
+    exit 1
+fi
+
+"$REAL_VPNC_SCRIPT" "$@"
+status=$?
+[[ $status -eq 0 ]] || exit "$status"
+
+[[ "${CUVPN_MODE:-}" == "limited" ]] || exit 0
+
+case "${reason:-}" in
+    connect|reconnect) ;;
+    *) exit 0 ;;
+esac
+
+ifname="${TUNDEV:-}"
+[[ -n "$ifname" ]] || exit 0
+
+# CU Boulder address blocks (verified via ARIN whois). cuvpn's "limited" mode
+# pushes broader prefixes that collide with home WG / LAN / docker; only the
+# entries below get to stay on the cuvpn interface.
+declare -a keep_prefixes=(
+    128.138.0.0/16    # University of Colorado (ARIN NetName: COLORADO)
+    198.11.16.0/20    # University of Colorado Boulder (NETBLK-CU-B)
+    198.59.7.0/24     # CU Boulder services
+    204.228.80.0/24   # CU Boulder
+    172.21.39.0/24    # cuvpn-internal NAT pool
+)
+
+# Override via env var or config file (one CIDR per line, # comments OK).
+if [[ -n "${CUVPN_KEEP_PREFIXES:-}" ]]; then
+    read -ra keep_prefixes <<<"$CUVPN_KEEP_PREFIXES"
+else
+    for f in "${HOME:-/root}/.config/cuvpn/keep-prefixes" /etc/cuvpn/keep-prefixes; do
+        [[ -r "$f" ]] || continue
+        declare -a file_prefixes=()
+        while IFS= read -r line; do
+            line="${line%%#*}"; line="${line//[[:space:]]/}"
+            [[ -n "$line" ]] && file_prefixes+=("$line")
+        done <"$f"
+        if [[ ${#file_prefixes[@]} -gt 0 ]]; then
+            keep_prefixes=("${file_prefixes[@]}")
+        fi
+        break
+    done
+fi
+
+LOG=/tmp/cuvpn-vpnc-script.log
+{
+    echo "=== $(date -Iseconds) reason=${reason:-?} ifname=$ifname ==="
+    echo "keep_prefixes: ${keep_prefixes[*]}"
+    echo "--- routes on $ifname before strip ---"
+    ip -o route show dev "$ifname" 2>/dev/null
+} >> "$LOG" 2>&1
+
+while read -r prefix; do
+    [[ -z "$prefix" || "$prefix" == "default" ]] && continue
+    keep=0
+    for k in "${keep_prefixes[@]}"; do
+        [[ "$prefix" == "$k" ]] && { keep=1; break; }
+    done
+    if [[ $keep -eq 0 ]]; then
+        echo "[$(date -Iseconds)] DROP $prefix dev $ifname" >> "$LOG"
+        ip route del "$prefix" dev "$ifname" 2>/dev/null || true
+    else
+        echo "[$(date -Iseconds)] KEEP $prefix dev $ifname" >> "$LOG"
+    fi
+done < <(ip -o route show dev "$ifname" 2>/dev/null | awk '{print $1}')
+
+{
+    echo "--- routes on $ifname after strip ---"
+    ip -o route show dev "$ifname" 2>/dev/null
+} >> "$LOG" 2>&1
+
+# Scope cuvpn DNS: only *.colorado.edu queries route here, never default.
+declare -a dns_zones
+if [[ -n "${CUVPN_DNS_ZONES:-}" ]]; then
+    read -ra dns_zones <<<"$CUVPN_DNS_ZONES"
+else
+    dns_zones=(~int.colorado.edu ~ad.colorado.edu ~colorado.edu)
+fi
+
+if command -v resolvectl >/dev/null; then
+    {
+        echo "--- scoping DNS on $ifname to ${dns_zones[*]} ---"
+        resolvectl domain "$ifname" "${dns_zones[@]}" 2>&1
+        resolvectl default-route "$ifname" false 2>&1
+        echo "--- resolvectl status $ifname ---"
+        resolvectl status "$ifname" 2>&1
+        echo
+    } >> "$LOG" 2>&1
+else
+    echo "[$(date -Iseconds)] WARN resolvectl not found; cuvpn DNS scoping skipped" >> "$LOG"
+fi
+
+exit 0

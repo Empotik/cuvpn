@@ -1,0 +1,11 @@
+# Editor
+*.swp
+*~
+.vscode/
+.idea/
+
+# Python (in case anyone vendors the venv into the repo by accident)
+__pycache__/
+*.py[cod]
+.venv/
+venv/

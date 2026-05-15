@@ -1,0 +1,468 @@
+#!/usr/bin/fish
+
+set -g CUVPN_HOST vpn.colorado.edu
+set -g CUVPN_LIMITED_GROUP limited
+set -g CUVPN_DEFAULT_MODE limited
+set -g CUVPN_SSO_BIN "$HOME/.local/share/cuvpn/venv/bin/openconnect-lite"
+set -g CUVPN_IFNAME cuvpn
+set -g CUVPN_VPNC_SCRIPT "$HOME/.local/bin/cuvpn-vpnc-script"
+set -g CUVPN_CACHE_DIR "$HOME/.cache/cuvpn"
+set -g CUVPN_USER_CONFIG "$HOME/.config/cuvpn/user"
+set -g CUVPN_PIDFILE "$CUVPN_CACHE_DIR/pid"
+set -g CUVPN_STATEFILE "$CUVPN_CACHE_DIR/state.fish"
+
+function cuvpn_usage
+    echo "Usage:"
+    echo "  cuvpn install"
+    echo "  cuvpn connect [limited|full] [--user USER]"
+    echo "  cuvpn limited [--user USER]"
+    echo "  cuvpn full [--user USER]"
+    echo "  cuvpn disconnect"
+    echo "  cuvpn fix-routes"
+    echo "  cuvpn status"
+    echo
+    echo "Defaults:"
+    echo "  mode:    $CUVPN_DEFAULT_MODE"
+    echo "  user:    set CUVPN_USER, write $CUVPN_USER_CONFIG, or pass --user"
+end
+
+function cuvpn_ensure_cache_dir
+    mkdir -p "$CUVPN_CACHE_DIR"
+end
+
+function cuvpn_default_user
+    if set -q CUVPN_USER
+        echo $CUVPN_USER
+        return 0
+    end
+    if test -r "$CUVPN_USER_CONFIG"
+        set -l u (string trim < "$CUVPN_USER_CONFIG" | string match -rv '^\s*(#|$)' | head -n1)
+        if test -n "$u"
+            echo "$u"
+            return 0
+        end
+    end
+    return 1
+end
+
+function cuvpn_require --argument-names cmd
+    if not command -sq "$cmd"
+        echo "Missing required command: $cmd" >&2
+        return 1
+    end
+end
+
+function cuvpn_mode_usergroup --argument-names mode
+    switch "$mode"
+        case limited
+            echo $CUVPN_LIMITED_GROUP
+        case full
+            return 0
+        case '*'
+            echo "Unknown CU VPN mode: $mode" >&2
+            return 1
+    end
+end
+
+function cuvpn_read_pid
+    if test -f "$CUVPN_PIDFILE"
+        string trim < "$CUVPN_PIDFILE"
+    end
+end
+
+function cuvpn_pid_alive --argument-names pid
+    if test -z "$pid"
+        return 1
+    end
+
+    set -l comm (ps -p "$pid" -o comm= 2>/dev/null | string trim)
+    test "$comm" = openconnect
+end
+
+function cuvpn_parse_auth_value --argument-names key
+    set -e argv[1]
+    for line in $argv
+        if string match -qr "^$key=" -- "$line"
+            set -l raw (string replace -r "^$key=" '' -- "$line")
+            string unescape --style=script -- "$raw"
+            return 0
+        end
+    end
+    return 1
+end
+
+function cuvpn_write_state --argument-names mode user host usergroup pid
+    cuvpn_ensure_cache_dir
+
+    printf "set -g cuvpn_state_mode %s\n" (string escape --style=script -- "$mode") > "$CUVPN_STATEFILE"
+    printf "set -g cuvpn_state_user %s\n" (string escape --style=script -- "$user") >> "$CUVPN_STATEFILE"
+    printf "set -g cuvpn_state_host %s\n" (string escape --style=script -- "$host") >> "$CUVPN_STATEFILE"
+    printf "set -g cuvpn_state_usergroup %s\n" (string escape --style=script -- "$usergroup") >> "$CUVPN_STATEFILE"
+    printf "set -g cuvpn_state_ifname %s\n" (string escape --style=script -- "$CUVPN_IFNAME") >> "$CUVPN_STATEFILE"
+    printf "set -g cuvpn_state_pid %s\n" (string escape --style=script -- "$pid") >> "$CUVPN_STATEFILE"
+end
+
+function cuvpn_clear_state
+    rm -f "$CUVPN_PIDFILE" "$CUVPN_STATEFILE"
+end
+
+function cuvpn_route_keep_prefixes --argument-names mode
+    # CU Boulder network prefixes that legitimately belong on cuvpn's routing
+    # table when in limited mode. Anything else cuvpn installs is over-push
+    # (collides with home WG / local LAN / docker) and gets stripped. Keep in
+    # sync with cuvpn-vpnc-script's CUVPN_KEEP_PREFIXES default.
+    switch "$mode"
+        case limited
+            echo 128.138.0.0/16        # University of Colorado (ARIN NetName: COLORADO)
+            echo 198.11.16.0/20        # University of Colorado Boulder (NETBLK-CU-B)
+            echo 198.59.7.0/24         # CU Boulder services
+            echo 204.228.80.0/24       # CU Boulder
+            echo 172.21.39.0/24        # cuvpn-internal NAT pool
+    end
+end
+
+function cuvpn_apply_dns_scoping --argument-names ifname
+    # Re-assert the cuvpn link's DNS scope to *.colorado.edu zones only and
+    # strip any default-route claim. cuvpn-vpnc-script does this once on
+    # connect; this is the runtime re-apply path used by `cuvpn fix-routes`
+    # in case CU re-pushes resolver state.
+    if not command -sq resolvectl
+        echo "WARN: resolvectl not found; cuvpn DNS scoping skipped" >&2
+        return 0
+    end
+
+    set -l zones '~int.colorado.edu' '~ad.colorado.edu' '~colorado.edu'
+    if set -q CUVPN_DNS_ZONES
+        set zones (string split ' ' -- $CUVPN_DNS_ZONES)
+    end
+
+    echo "Scoping DNS on $ifname to $zones."
+    sudo resolvectl domain "$ifname" $zones
+    or return $status
+    sudo resolvectl default-route "$ifname" false
+end
+
+function cuvpn_fix_routes_connected --argument-names mode ifname
+    set -l changed 0
+    set -l keep_prefixes (cuvpn_route_keep_prefixes "$mode")
+    set -l LOG /tmp/cuvpn-fix-routes.log
+    echo "=== "(date -Iseconds)" mode=$mode ifname=$ifname ===" >> $LOG
+    echo "keep_prefixes: $keep_prefixes" >> $LOG
+    echo "--- before ---" >> $LOG
+    ip -o route show dev "$ifname" >> $LOG 2>&1
+
+    # Iterate every route currently installed on the cuvpn interface; remove
+    # any that's not in the CU-Boulder keep-list. Skip default route (only
+    # full-tunnel mode installs one, and this code path is gated to limited).
+    for prefix in (ip -o route show dev "$ifname" 2>/dev/null | awk '{print $1}')
+        if test -z "$prefix"; or test "$prefix" = default
+            continue
+        end
+        if contains -- "$prefix" $keep_prefixes
+            echo "KEEP $prefix" >> $LOG
+            continue
+        end
+        echo "DROP $prefix" >> $LOG
+        echo "Removing non-CU VPN route $prefix from $ifname."
+        sudo ip route del "$prefix" dev "$ifname"
+        or return $status
+        set changed 1
+    end
+    echo "--- after ---" >> $LOG
+    ip -o route show dev "$ifname" >> $LOG 2>&1
+
+    if test $changed -eq 0
+        echo "No conflicting CU VPN routes needed fixing."
+    end
+end
+
+function cuvpn_fix_routes
+    set -l pid (cuvpn_read_pid)
+    if test -f "$CUVPN_STATEFILE"
+        source "$CUVPN_STATEFILE"
+    end
+
+    if not cuvpn_pid_alive "$pid"
+        echo "CU VPN is not running." >&2
+        return 1
+    end
+
+    set -l mode (set -q cuvpn_state_mode; and echo $cuvpn_state_mode; or echo unknown)
+    set -l ifname (set -q cuvpn_state_ifname; and echo $cuvpn_state_ifname; or echo $CUVPN_IFNAME)
+
+    sudo -v; or return $status
+    cuvpn_fix_routes_connected "$mode" "$ifname"
+    or return $status
+
+    if test "$mode" = limited
+        cuvpn_apply_dns_scoping "$ifname"
+    end
+end
+
+function cuvpn_install
+    if not command -sq pacman
+        echo "cuvpn install currently supports Arch/CachyOS systems via pacman." >&2
+        return 1
+    end
+
+    sudo pacman -S --needed openconnect vpnc python
+    or return $status
+
+    # openconnect-lite (Python) — provides SAML/SSO auth flow with browser-in-terminal
+    # support. cuvpn falls back to plain openconnect prompts if this is missing.
+    set -l venv "$CUVPN_SSO_BIN"
+    set -l venv_dir (path dirname (path dirname -- "$venv"))  # …/cuvpn/venv
+    if test -x "$venv"
+        echo "openconnect-lite already installed at $venv_dir"
+    else
+        mkdir -p (path dirname -- "$venv_dir")
+        echo "Creating Python venv for openconnect-lite at $venv_dir..."
+        python -m venv "$venv_dir"
+        or return $status
+        "$venv_dir/bin/pip" install --upgrade pip
+        or return $status
+        "$venv_dir/bin/pip" install openconnect-lite
+        or return $status
+    end
+end
+
+function cuvpn_connect
+    argparse h/help u/user= -- $argv
+    or return 2
+
+    if set -q _flag_help
+        cuvpn_usage
+        return 0
+    end
+
+    set -l mode $CUVPN_DEFAULT_MODE
+    if test (count $argv) -gt 0
+        switch "$argv[1]"
+            case limited full
+                set mode "$argv[1]"
+                set -e argv[1]
+            case '*'
+                echo "Unknown mode: $argv[1]" >&2
+                return 2
+        end
+    end
+
+    if test (count $argv) -gt 0
+        echo "Unexpected arguments: $argv" >&2
+        return 2
+    end
+
+    set -l user
+    if set -q _flag_user
+        set user "$_flag_user"
+    else
+        set user (cuvpn_default_user)
+    end
+    if test -z "$user"
+        echo "No CU username configured." >&2
+        echo "Set CUVPN_USER in your environment, write your identikey to" >&2
+        echo "$CUVPN_USER_CONFIG, or pass --user IDENTIKEY." >&2
+        return 2
+    end
+
+    cuvpn_require openconnect; or return 1
+    cuvpn_require sudo; or return 1
+    sudo -v; or return $status
+    if not test -x "$CUVPN_VPNC_SCRIPT"
+        echo "Missing executable helper script: $CUVPN_VPNC_SCRIPT" >&2
+        return 1
+    end
+
+    cuvpn_ensure_cache_dir
+
+    set -l stale_pid (cuvpn_read_pid)
+    if cuvpn_pid_alive "$stale_pid"
+        echo "CU VPN already appears to be running (PID $stale_pid)." >&2
+        echo "Use 'cuvpn disconnect' first if you want to reconnect." >&2
+        return 1
+    end
+    cuvpn_clear_state
+
+    set -l host $CUVPN_HOST
+    set -l usergroup (cuvpn_mode_usergroup "$mode")
+    or return 2
+
+    set -l auth_host "$host"
+    set -l cookie
+    set -l fingerprint
+
+    if test -x "$CUVPN_SSO_BIN"
+        # Terminal-only mode auto-engages when there's no X display (SSH session
+        # without --X11 forwarding). Forced via CUVPN_TERMINAL=1 too.
+        set -l terminal_mode 0
+        if test "$CUVPN_TERMINAL" = 1
+            set terminal_mode 1
+        else if not set -q DISPLAY; or test -z "$DISPLAY"
+            set terminal_mode 1
+        end
+
+        if test "$terminal_mode" = 1
+            echo "Connecting to CU Boulder $mode VPN via terminal SSO (no X display)..." >&2
+        else
+            echo "Connecting to CU Boulder $mode VPN via browser SSO..." >&2
+        end
+
+        set -l auth_xdg_dir
+        set auth_xdg_dir (mktemp -d)
+        or return $status
+        set -l auth_cmd env XDG_CONFIG_HOME="$auth_xdg_dir" "$CUVPN_SSO_BIN" --server "$host" --authenticate shell -l ERROR
+
+        if test -n "$usergroup"
+            set auth_cmd $auth_cmd --usergroup "$usergroup"
+        end
+
+        if test "$terminal_mode" = 1
+            set auth_cmd $auth_cmd --browser-display-mode terminal
+        end
+
+        set -l auth_output
+        set -l auth_status
+        if test "$terminal_mode" = 1
+            # Stream stderr to the user's terminal (so the SSO prompt is live);
+            # capture stdout for the shell-format auth output.
+            set auth_output ($auth_cmd 2>/dev/tty)
+            set auth_status $status
+        else
+            set auth_output ($auth_cmd 2>&1)
+            set auth_status $status
+        end
+        if test -n "$auth_xdg_dir"
+            rm -rf "$auth_xdg_dir"
+        end
+
+        if test $auth_status -ne 0
+            printf '%s\n' $auth_output >&2
+            return $auth_status
+        end
+
+        set auth_host (cuvpn_parse_auth_value HOST $auth_output)
+        set cookie (cuvpn_parse_auth_value COOKIE $auth_output)
+        set fingerprint (cuvpn_parse_auth_value FINGERPRINT $auth_output)
+
+        if test -z "$auth_host" -o -z "$cookie" -o -z "$fingerprint"
+            echo "Failed to extract authentication details from openconnect-lite." >&2
+            printf '%s\n' $auth_output >&2
+            return 1
+        end
+    else
+        echo "Connecting to CU Boulder $mode VPN..." >&2
+        echo "OpenConnect will prompt in the terminal for your CU credentials." >&2
+        set cookie ""
+        set fingerprint ""
+    end
+
+    set -l connect_cmd openconnect --protocol=anyconnect --background --pid-file "$CUVPN_PIDFILE" --interface "$CUVPN_IFNAME" --script "$CUVPN_VPNC_SCRIPT"
+    if test -n "$cookie"
+        set connect_cmd $connect_cmd --cookie="$cookie" --servercert="$fingerprint"
+    else
+        set connect_cmd $connect_cmd --user="$user" --no-external-auth
+        if test -n "$usergroup"
+            set connect_cmd $connect_cmd --usergroup="$usergroup"
+        end
+    end
+    set connect_cmd $connect_cmd "$auth_host"
+
+    sudo CUVPN_MODE="$mode" $connect_cmd
+    or return $status
+
+    set -l pid (cuvpn_read_pid)
+    if not cuvpn_pid_alive "$pid"
+        echo "OpenConnect did not stay running after startup." >&2
+        return 1
+    end
+
+    cuvpn_write_state "$mode" "$user" "$auth_host" "$usergroup" "$pid"
+    cuvpn_status
+end
+
+function cuvpn_disconnect
+    set -l pid (cuvpn_read_pid)
+    if not cuvpn_pid_alive "$pid"
+        echo "CU VPN is not running." >&2
+        cuvpn_clear_state
+        return 1
+    end
+
+    sudo kill -TERM "$pid"
+    or return $status
+
+    for _wait_idx in (seq 1 20)
+        if not cuvpn_pid_alive "$pid"
+            break
+        end
+        sleep 0.2
+    end
+
+    if cuvpn_pid_alive "$pid"
+        echo "OpenConnect did not stop cleanly; killing it." >&2
+        sudo kill -KILL "$pid"
+        or return $status
+    end
+
+    cuvpn_clear_state
+    echo "CU VPN disconnected."
+end
+
+function cuvpn_status
+    set -l pid (cuvpn_read_pid)
+    if test -f "$CUVPN_STATEFILE"
+        source "$CUVPN_STATEFILE"
+    end
+
+    if cuvpn_pid_alive "$pid"
+        echo "Connected: yes"
+        echo "Mode:      "(set -q cuvpn_state_mode; and echo $cuvpn_state_mode; or echo unknown)
+        echo "User:      "(set -q cuvpn_state_user; and echo $cuvpn_state_user; or echo unknown)
+        echo "Host:      "(set -q cuvpn_state_host; and echo $cuvpn_state_host; or echo unknown)
+        if set -q cuvpn_state_usergroup; and test -n "$cuvpn_state_usergroup"
+            echo "Path:      $cuvpn_state_usergroup"
+        end
+        echo "PID:       $pid"
+        set -l ifname $CUVPN_IFNAME
+        if set -q cuvpn_state_ifname
+            set ifname $cuvpn_state_ifname
+        end
+        set -l addr_line (ip -brief addr show "$ifname" 2>/dev/null | string trim)
+        if test -n "$addr_line"
+            echo "Interface: $addr_line"
+        end
+        return 0
+    end
+
+    echo "Connected: no"
+    return 1
+end
+
+if test (count $argv) -eq 0
+    cuvpn_usage
+    exit 2
+end
+
+set -l subcommand "$argv[1]"
+set -e argv[1]
+
+switch "$subcommand"
+    case install
+        cuvpn_install
+    case connect
+        cuvpn_connect $argv
+    case limited full
+        cuvpn_connect "$subcommand" $argv
+    case disconnect down stop
+        cuvpn_disconnect
+    case fix-routes
+        cuvpn_fix_routes
+    case status
+        cuvpn_status
+    case help -h --help
+        cuvpn_usage
+    case '*'
+        echo "Unknown subcommand: $subcommand" >&2
+        cuvpn_usage >&2
+        exit 2
+end
