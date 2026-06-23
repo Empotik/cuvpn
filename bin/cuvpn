@@ -10,6 +10,8 @@ set -g CUVPN_CACHE_DIR "$HOME/.cache/cuvpn"
 set -g CUVPN_USER_CONFIG "$HOME/.config/cuvpn/user"
 set -g CUVPN_PIDFILE "$CUVPN_CACHE_DIR/pid"
 set -g CUVPN_STATEFILE "$CUVPN_CACHE_DIR/state.fish"
+set -g CUVPN_SESSIONFILE "$CUVPN_CACHE_DIR/session.fish"
+set -g CUVPN_HEALTHFAIL "$CUVPN_CACHE_DIR/healthfail"
 
 function cuvpn_usage
     echo "Usage:"
@@ -17,7 +19,10 @@ function cuvpn_usage
     echo "  cuvpn connect [limited|full] [--user USER]"
     echo "  cuvpn limited [--user USER]"
     echo "  cuvpn full [--user USER]"
+    echo "  cuvpn reconnect [limited|full] [--user USER] [--fresh]"
     echo "  cuvpn disconnect"
+    echo "  cuvpn forget"
+    echo "  cuvpn watch [on|off|status]"
     echo "  cuvpn fix-routes"
     echo "  cuvpn status"
     echo
@@ -104,6 +109,58 @@ end
 
 function cuvpn_clear_state
     rm -f "$CUVPN_PIDFILE" "$CUVPN_STATEFILE"
+end
+
+function cuvpn_write_session --argument-names mode host cookie fingerprint usergroup
+    # Cache the VPN session cookie so `cuvpn reconnect` can re-establish the
+    # tunnel without a fresh SSO round-trip. Stored user-only (0600); the
+    # cookie is a live credential. Cleared by `cuvpn forget`.
+    cuvpn_ensure_cache_dir
+    printf "set -g cuvpn_sess_mode %s\n" (string escape --style=script -- "$mode") > "$CUVPN_SESSIONFILE"
+    chmod 600 "$CUVPN_SESSIONFILE"
+    printf "set -g cuvpn_sess_host %s\n" (string escape --style=script -- "$host") >> "$CUVPN_SESSIONFILE"
+    printf "set -g cuvpn_sess_cookie %s\n" (string escape --style=script -- "$cookie") >> "$CUVPN_SESSIONFILE"
+    printf "set -g cuvpn_sess_fingerprint %s\n" (string escape --style=script -- "$fingerprint") >> "$CUVPN_SESSIONFILE"
+    printf "set -g cuvpn_sess_usergroup %s\n" (string escape --style=script -- "$usergroup") >> "$CUVPN_SESSIONFILE"
+end
+
+function cuvpn_launch_openconnect --argument-names mode user auth_host cookie fingerprint usergroup
+    # Shared connect path for both `cuvpn connect` and `cuvpn reconnect`. With a
+    # cookie it reuses an existing SSO/VPN session (no prompt); without one it
+    # falls back to openconnect's own credential handling. On success it records
+    # state and (when a cookie was used) refreshes the cached session.
+    # Bound how long openconnect retries a broken link before giving up and
+    # exiting (default 300s); a shorter window hands a real drop to the
+    # watchdog faster. Override with CUVPN_RECONNECT_TIMEOUT.
+    set -l reconnect_timeout 60
+    if set -q CUVPN_RECONNECT_TIMEOUT; and test -n "$CUVPN_RECONNECT_TIMEOUT"
+        set reconnect_timeout "$CUVPN_RECONNECT_TIMEOUT"
+    end
+
+    set -l connect_cmd openconnect --protocol=anyconnect --background --reconnect-timeout "$reconnect_timeout" --pid-file "$CUVPN_PIDFILE" --interface "$CUVPN_IFNAME" --script "$CUVPN_VPNC_SCRIPT"
+    if test -n "$cookie"
+        set connect_cmd $connect_cmd --cookie="$cookie" --servercert="$fingerprint"
+    else
+        set connect_cmd $connect_cmd --user="$user" --no-external-auth
+        if test -n "$usergroup"
+            set connect_cmd $connect_cmd --usergroup="$usergroup"
+        end
+    end
+    set connect_cmd $connect_cmd "$auth_host"
+
+    cuvpn_sudo CUVPN_MODE="$mode" $connect_cmd
+    or return $status
+
+    set -l pid (cuvpn_read_pid)
+    if not cuvpn_pid_alive "$pid"
+        echo "OpenConnect did not stay running after startup." >&2
+        return 1
+    end
+
+    cuvpn_write_state "$mode" "$user" "$auth_host" "$usergroup" "$pid"
+    if test -n "$cookie"
+        cuvpn_write_session "$mode" "$auth_host" "$cookie" "$fingerprint" "$usergroup"
+    end
 end
 
 function cuvpn_route_keep_prefixes --argument-names mode
@@ -302,7 +359,7 @@ function cuvpn_connect
         end
 
         if test "$terminal_mode" = 1
-            echo "Connecting to CU Boulder $mode VPN via terminal SSO (no X display)..." >&2
+            echo "No graphical display detected; using headless SSO (needs saved credentials)..." >&2
         else
             echo "Connecting to CU Boulder $mode VPN via browser SSO..." >&2
         end
@@ -317,7 +374,12 @@ function cuvpn_connect
         end
 
         if test "$terminal_mode" = 1
-            set auth_cmd $auth_cmd --browser-display-mode terminal
+            # openconnect-lite 0.8.7 dropped the old "terminal" display mode;
+            # valid choices are now {shown, hidden}. Headless sessions use
+            # "hidden" (a non-visible browser) which works once SSO credentials
+            # are saved; a first-time interactive MFA still needs a graphical
+            # session.
+            set auth_cmd $auth_cmd --browser-display-mode hidden
         end
 
         set -l auth_output
@@ -356,28 +418,275 @@ function cuvpn_connect
         set fingerprint ""
     end
 
-    set -l connect_cmd openconnect --protocol=anyconnect --background --pid-file "$CUVPN_PIDFILE" --interface "$CUVPN_IFNAME" --script "$CUVPN_VPNC_SCRIPT"
-    if test -n "$cookie"
-        set connect_cmd $connect_cmd --cookie="$cookie" --servercert="$fingerprint"
-    else
-        set connect_cmd $connect_cmd --user="$user" --no-external-auth
-        if test -n "$usergroup"
-            set connect_cmd $connect_cmd --usergroup="$usergroup"
+    cuvpn_launch_openconnect "$mode" "$user" "$auth_host" "$cookie" "$fingerprint" "$usergroup"
+    or return $status
+    cuvpn_arm_watchdog
+    cuvpn_status
+end
+
+function cuvpn_reconnect
+    argparse h/help u/user= fresh -- $argv
+    or return 2
+
+    if set -q _flag_help
+        cuvpn_usage
+        return 0
+    end
+
+    set -l mode
+    if test (count $argv) -gt 0
+        switch "$argv[1]"
+            case limited full
+                set mode "$argv[1]"
+                set -e argv[1]
+            case '*'
+                echo "Unknown mode: $argv[1]" >&2
+                return 2
         end
     end
-    set connect_cmd $connect_cmd "$auth_host"
+    if test (count $argv) -gt 0
+        echo "Unexpected arguments: $argv" >&2
+        return 2
+    end
 
-    sudo CUVPN_MODE="$mode" $connect_cmd
-    or return $status
+    if test -f "$CUVPN_STATEFILE"
+        source "$CUVPN_STATEFILE"
+    end
+    if test -f "$CUVPN_SESSIONFILE"
+        source "$CUVPN_SESSIONFILE"
+    end
 
-    set -l pid (cuvpn_read_pid)
-    if not cuvpn_pid_alive "$pid"
-        echo "OpenConnect did not stay running after startup." >&2
+    # Resolve the mode/user to reconnect with: explicit arg/flag wins, else the
+    # last live session, else the cached cookie's mode, else the default.
+    if test -z "$mode"
+        if set -q cuvpn_state_mode; and test -n "$cuvpn_state_mode"
+            set mode "$cuvpn_state_mode"
+        else if set -q cuvpn_sess_mode; and test -n "$cuvpn_sess_mode"
+            set mode "$cuvpn_sess_mode"
+        else
+            set mode "$CUVPN_DEFAULT_MODE"
+        end
+    end
+
+    set -l user
+    if set -q _flag_user
+        set user "$_flag_user"
+    else if set -q cuvpn_state_user; and test -n "$cuvpn_state_user"
+        set user "$cuvpn_state_user"
+    else
+        set user (cuvpn_default_user)
+    end
+
+    cuvpn_require openconnect; or return 1
+    cuvpn_require sudo; or return 1
+    cuvpn_sudo -v; or return $status
+
+    # Decide up front whether cookie-first is even possible, because it changes
+    # HOW we tear down the current tunnel.
+    set -l try_cookie 0
+    if not set -q _flag_fresh
+        if set -q cuvpn_sess_cookie; and test -n "$cuvpn_sess_cookie"; and test "$cuvpn_sess_mode" = "$mode"
+            set try_cookie 1
+        end
+    end
+
+    set -l cur_pid (cuvpn_read_pid)
+    if cuvpn_pid_alive "$cur_pid"
+        if test $try_cookie -eq 1
+            # Hard-kill WITHOUT a graceful logout. A clean disconnect tells CU
+            # to end the session, which invalidates the very cookie we want to
+            # reuse (openconnect then gets HTTP 401). SIGKILL leaves the server
+            # session — and its cookie — alive, the same state a real drop
+            # produces, so cookie-first can resume it. The kernel tears down the
+            # non-persistent tun (and its routes) when the process dies.
+            echo "Reconnecting: dropping tunnel but keeping the session alive..." >&2
+            cuvpn_sudo kill -KILL "$cur_pid" 2>/dev/null
+            for _wait_idx in (seq 1 15)
+                cuvpn_pid_alive "$cur_pid"; or break
+                sleep 0.2
+            end
+        else
+            echo "Reconnecting: dropping current CU VPN session..." >&2
+            cuvpn_disconnect >/dev/null 2>&1
+        end
+    end
+    cuvpn_clear_state
+
+    # Cookie-first: reuse the cached VPN session cookie. Skips SSO entirely.
+    if test $try_cookie -eq 1
+        echo "Trying cached session cookie (no SSO)..." >&2
+        if cuvpn_launch_openconnect "$mode" "$user" "$cuvpn_sess_host" "$cuvpn_sess_cookie" "$cuvpn_sess_fingerprint" "$cuvpn_sess_usergroup"
+            cuvpn_arm_watchdog
+            cuvpn_status
+            return 0
+        end
+        echo "Cached cookie was rejected or expired." >&2
+    end
+
+    # --cookie-only (used by the watchdog) must never open an interactive SSO.
+    if set -q _flag_cookie_only
         return 1
     end
 
-    cuvpn_write_state "$mode" "$user" "$auth_host" "$usergroup" "$pid"
-    cuvpn_status
+    # Fall back to a full connect (fresh SSO).
+    set -l connect_args $mode
+    if test -n "$user"
+        set connect_args $connect_args --user "$user"
+    end
+    cuvpn_connect $connect_args
+end
+
+function cuvpn_forget
+    if test -f "$CUVPN_SESSIONFILE"
+        rm -f "$CUVPN_SESSIONFILE"
+        echo "Cleared the cached CU VPN session cookie."
+    else
+        echo "No cached CU VPN session cookie to clear."
+    end
+end
+
+# ---------------------------------------------------------------------------
+# Auto-reconnect watchdog (systemd user timer -> `cuvpn _healthcheck`)
+# ---------------------------------------------------------------------------
+
+function cuvpn_detect_askpass
+    # GUI password helper for `sudo -A`, so the watchdog can get root
+    # unattended without a terminal. Override with CUVPN_ASKPASS.
+    if set -q CUVPN_ASKPASS; and test -x "$CUVPN_ASKPASS"
+        echo "$CUVPN_ASKPASS"
+        return 0
+    end
+    for c in /usr/bin/ksshaskpass /usr/lib/seahorse/ssh-askpass /usr/bin/lxqt-openssh-askpass /usr/bin/ssh-askpass /usr/lib/ssh/ssh-askpass
+        if test -x "$c"
+            echo "$c"
+            return 0
+        end
+    end
+    return 1
+end
+
+function cuvpn_sudo
+    # Interactive (a TTY is present): plain sudo, terminal password prompt.
+    # Unattended (no TTY, e.g. the systemd watchdog): use sudo's askpass so a
+    # GUI password dialog appears instead of hanging on a terminal read.
+    if isatty stdin
+        sudo $argv
+        return $status
+    end
+    set -l askpass (cuvpn_detect_askpass)
+    if test -n "$askpass"
+        SUDO_ASKPASS="$askpass" sudo -A $argv
+        return $status
+    end
+    sudo -n $argv
+end
+
+function cuvpn_notify --argument-names title body
+    if command -sq notify-send
+        notify-send -a cuvpn -u critical "$title" "$body" 2>/dev/null
+    end
+    echo "$title — $body" >&2
+end
+
+function cuvpn_probe
+    # Optional active liveness probe (opt-in via CUVPN_PROBE_TARGET=host:port):
+    # a TCP connect that only succeeds through the tunnel. Off by default to
+    # avoid false positives against an unverified target.
+    set -l target "$CUVPN_PROBE_TARGET"
+    test -n "$target"; or return 0
+    set -l parts (string split ':' -- "$target")
+    set -l host $parts[1]
+    set -l port $parts[2]
+    test -n "$host" -a -n "$port"; or return 0
+    timeout 3 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null
+end
+
+function cuvpn_arm_watchdog
+    if test "$CUVPN_AUTORECONNECT" = 0
+        return 0
+    end
+    command -sq systemctl; or return 0
+    test -f "$HOME/.config/systemd/user/cuvpn-watchdog.timer"; or return 0
+    # Export the graphical-session vars so ksshaskpass / notify-send can reach
+    # the desktop from the (otherwise headless) user service.
+    systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XDG_RUNTIME_DIR XAUTHORITY DBUS_SESSION_BUS_ADDRESS 2>/dev/null
+    if systemctl --user start cuvpn-watchdog.timer 2>/dev/null
+        echo "Auto-reconnect watchdog armed." >&2
+    end
+end
+
+function cuvpn_disarm_watchdog
+    command -sq systemctl; or return 0
+    systemctl --user stop cuvpn-watchdog.timer 2>/dev/null
+    rm -f "$CUVPN_HEALTHFAIL"
+end
+
+function cuvpn_healthcheck
+    # Invoked by the watchdog timer. Reconnect when openconnect has exited (the
+    # tunnel dropped). Safe by default: a live openconnect is left alone unless
+    # an opt-in active probe fails repeatedly, so we never fight its own
+    # reconnect logic.
+    if test "$CUVPN_AUTORECONNECT" = 0
+        cuvpn_disarm_watchdog
+        return 0
+    end
+    test -f "$CUVPN_STATEFILE"; or return 0
+    source "$CUVPN_STATEFILE"
+
+    set -l pid (cuvpn_read_pid)
+    if not cuvpn_pid_alive "$pid"
+        rm -f "$CUVPN_HEALTHFAIL"
+        cuvpn_healthcheck_reconnect "openconnect exited"
+        return $status
+    end
+
+    if not set -q CUVPN_PROBE_TARGET; or test -z "$CUVPN_PROBE_TARGET"
+        return 0
+    end
+    if cuvpn_probe
+        rm -f "$CUVPN_HEALTHFAIL"
+        return 0
+    end
+    set -l fails 1
+    if test -f "$CUVPN_HEALTHFAIL"
+        set -l prev (string trim < "$CUVPN_HEALTHFAIL")
+        if string match -qr '^[0-9]+$' -- "$prev"
+            set fails (math $prev + 1)
+        end
+    end
+    echo $fails > "$CUVPN_HEALTHFAIL"
+    if test $fails -ge 3
+        rm -f "$CUVPN_HEALTHFAIL"
+        cuvpn_healthcheck_reconnect "tunnel stopped passing traffic"
+        return $status
+    end
+    return 0
+end
+
+function cuvpn_healthcheck_reconnect --argument-names reason
+    echo "cuvpn watchdog: $reason — reconnecting (cookie-only)." >&2
+    if cuvpn_reconnect --cookie-only
+        return 0
+    end
+    cuvpn_notify "CU VPN needs you" "Auto-reconnect couldn't reuse the saved session ($reason). Run 'cuvpn limited' to log in again."
+    # Stop firing until you reconnect, so we don't spam password dialogs.
+    cuvpn_disarm_watchdog
+    return 1
+end
+
+function cuvpn_watch --argument-names action
+    switch "$action"
+        case on start ''
+            cuvpn_arm_watchdog
+        case off stop
+            cuvpn_disarm_watchdog
+            echo "Auto-reconnect watchdog disarmed." >&2
+        case status
+            systemctl --user status cuvpn-watchdog.timer
+        case '*'
+            echo "Usage: cuvpn watch [on|off|status]" >&2
+            return 2
+    end
 end
 
 function cuvpn_disconnect
@@ -388,7 +697,7 @@ function cuvpn_disconnect
         return 1
     end
 
-    sudo kill -TERM "$pid"
+    cuvpn_sudo kill -TERM "$pid"
     or return $status
 
     for _wait_idx in (seq 1 20)
@@ -400,7 +709,7 @@ function cuvpn_disconnect
 
     if cuvpn_pid_alive "$pid"
         echo "OpenConnect did not stop cleanly; killing it." >&2
-        sudo kill -KILL "$pid"
+        cuvpn_sudo kill -KILL "$pid"
         or return $status
     end
 
@@ -455,6 +764,15 @@ switch "$subcommand"
         cuvpn_connect "$subcommand" $argv
     case disconnect down stop
         cuvpn_disconnect
+        cuvpn_disarm_watchdog
+    case reconnect
+        cuvpn_reconnect $argv
+    case forget
+        cuvpn_forget
+    case watch autoreconnect
+        cuvpn_watch $argv
+    case _healthcheck
+        cuvpn_healthcheck
     case fix-routes
         cuvpn_fix_routes
     case status

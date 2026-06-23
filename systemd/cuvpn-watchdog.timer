@@ -1,0 +1,11 @@
+[Unit]
+Description=cuvpn auto-reconnect watchdog timer
+
+[Timer]
+# First check 30s after arming, then every 30s after each check finishes.
+OnActiveSec=30
+OnUnitInactiveSec=30
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

@@ -33,6 +33,15 @@ for src in "${REPO_DIR}/bin/cuvpn" "${REPO_DIR}/bin/cuvpn-vpnc-script"; do
     fi
 done
 
+echo ">> Installing auto-reconnect watchdog (systemd user units)..."
+USER_UNIT_DIR="${HOME}/.config/systemd/user"
+mkdir -p "$USER_UNIT_DIR"
+for unit in cuvpn-watchdog.service cuvpn-watchdog.timer; do
+    ln -sfn "${REPO_DIR}/systemd/${unit}" "${USER_UNIT_DIR}/${unit}"
+    echo "  linked: ${USER_UNIT_DIR}/${unit} -> ${REPO_DIR}/systemd/${unit}"
+done
+systemctl --user daemon-reload 2>/dev/null || true
+
 if [[ -x "$SSO_BIN" ]]; then
     echo ">> openconnect-lite venv already present at ${VENV_DIR}"
 else

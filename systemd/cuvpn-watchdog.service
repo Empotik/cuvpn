@@ -1,0 +1,9 @@
+[Unit]
+Description=cuvpn auto-reconnect watchdog (reconnect CU VPN if it drops)
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=120
+# Runs as the user; openconnect gets root via sudo -A + ksshaskpass.
+ExecStart=%h/.local/bin/cuvpn _healthcheck
